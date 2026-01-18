@@ -1,0 +1,116 @@
+# AFK Ralph - runs multiple iterations autonomously
+# Usage: ralph-loop.ps1 <iterations>
+# Run in Docker sandbox: docker sandbox run claude ralph-loop 20
+#
+# Expects in project root:
+#   VISION.md  - End-state vision for the project
+#   AGENTS.md  - Instructions for AI agents
+#   .beads/    - Issue tracking database
+#
+# Tips applied:
+# - Start conservative (10-20 iterations) before scaling
+# - Each commit must pass all tests (Keep CI Green)
+# - Completion promise for explicit "done" signal
+
+param(
+    [Parameter(Position=0)]
+    [int]$Iterations
+)
+
+$ErrorActionPreference = "Stop"
+
+if (-not $Iterations -or $Iterations -le 0) {
+    Write-Host "Usage: ralph-loop.ps1 <iterations>"
+    Write-Host ""
+    Write-Host "Tip: Start with 10-20 iterations to understand token consumption."
+    Write-Host "     A 50-iteration loop can cost `$50-100+ on large codebases."
+    exit 1
+}
+
+# Check for required files
+if (-not (Test-Path "VISION.md")) {
+    Write-Host "Error: VISION.md not found. Run 'ralph-init' to create project files."
+    exit 1
+}
+
+if (-not (Test-Path "AGENTS.md")) {
+    Write-Host "Error: AGENTS.md not found. Run 'ralph-init' to create project files."
+    exit 1
+}
+
+if (-not (Test-Path "RAILS.md")) {
+    Write-Host "Error: RAILS.md not found. Run 'ralph-init' to create project files."
+    exit 1
+}
+
+if (-not (Test-Path "PROMPT.md")) {
+    Write-Host "Error: PROMPT.md not found. Run 'ralph-init' to create project files."
+    exit 1
+}
+
+$basePrompt = Get-Content -Path "PROMPT.md" -Raw
+
+# Safety guardrail
+$MAX_SAFE_ITERATIONS = 50
+if ($Iterations -gt $MAX_SAFE_ITERATIONS) {
+    Write-Host "Warning: $Iterations iterations exceeds safe limit of $MAX_SAFE_ITERATIONS."
+    $confirm = Read-Host "Are you sure? (y/N)"
+    if ($confirm -ne "y") {
+        exit 1
+    }
+}
+
+$timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
+$LOG_FILE = "ralph-log-$timestamp.txt"
+$startMessage = "Starting Ralph loop at $(Get-Date)"
+Write-Host $startMessage
+Add-Content -Path $LOG_FILE -Value $startMessage
+$maxMessage = "Max iterations: $Iterations"
+Write-Host $maxMessage
+Add-Content -Path $LOG_FILE -Value $maxMessage
+
+# Build full prompt: base prompt + loop-specific completion signal
+$loopSuffix = @"
+
+LOOP MODE INSTRUCTIONS:
+- You are running in a loop. Each iteration should complete exactly ONE task.
+- Ignore Backlog issues entirely - treat them as invisible.
+- After completing one task, simply end your response. Do NOT output <promise>COMPLETE</promise>.
+- ONLY output <promise>COMPLETE</promise> if 'bd ready' shows zero ready issues at the START of your run.
+- The loop controller will call you again for the next task.
+"@
+
+$prompt = $basePrompt + $loopSuffix
+
+for ($i = 1; $i -le $Iterations; $i++) {
+    Write-Host ""
+    Add-Content -Path $LOG_FILE -Value ""
+    $iterMessage = "=== Iteration $i of $Iterations ==="
+    Write-Host $iterMessage
+    Add-Content -Path $LOG_FILE -Value $iterMessage
+
+    # Run claude and capture output while displaying in real-time
+    claude --dangerously-skip-permissions -p $prompt 2>&1 | Tee-Object -Variable output
+    $output = $output -join "`n"
+
+    # Append to log file
+    Add-Content -Path $LOG_FILE -Value $output
+
+    if ($output -match "<promise>COMPLETE</promise>") {
+        Write-Host ""
+        Add-Content -Path $LOG_FILE -Value ""
+        $completeMessage = "All issues complete after $i iterations."
+        Write-Host $completeMessage
+        Add-Content -Path $LOG_FILE -Value $completeMessage
+        exit 0
+    }
+}
+
+Write-Host ""
+Add-Content -Path $LOG_FILE -Value ""
+$doneMessage = "Completed $Iterations iterations."
+Write-Host $doneMessage
+Add-Content -Path $LOG_FILE -Value $doneMessage
+$remainingMessage = "Run 'bd ready' to check remaining work."
+Write-Host $remainingMessage
+Add-Content -Path $LOG_FILE -Value $remainingMessage

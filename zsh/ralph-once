@@ -1,0 +1,36 @@
+#!/bin/bash
+
+# Human-in-the-loop Ralph - runs one iteration
+# Watch what Claude does, check the commit, run again
+# Tip: Start here before going AFK. Build intuition for how the loop works.
+#
+# Expects in project root:
+#   VISION.md  - End-state vision for the project
+#   AGENTS.md  - Instructions for AI agents
+#   .beads/    - Issue tracking database
+#
+# Uses beads + git history for context
+
+if [ ! -f "VISION.md" ]; then
+  echo "Error: VISION.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+if [ ! -f "AGENTS.md" ]; then
+  echo "Error: AGENTS.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+if [ ! -f "RAILS.md" ]; then
+  echo "Error: RAILS.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+if [ ! -f "PROMPT.md" ]; then
+  echo "Error: PROMPT.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+PROMPT=$(cat PROMPT.md)
+
+claude --dangerously-skip-permissions "$PROMPT"

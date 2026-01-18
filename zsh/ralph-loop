@@ -1,0 +1,100 @@
+#!/bin/bash
+set -e
+
+# AFK Ralph - runs multiple iterations autonomously
+# Usage: ralph-loop <iterations>
+# Run in Docker sandbox: docker sandbox run claude ralph-loop 20
+#
+# Expects in project root:
+#   VISION.md  - End-state vision for the project
+#   AGENTS.md  - Instructions for AI agents
+#   .beads/    - Issue tracking database
+#
+# Tips applied:
+# - Start conservative (10-20 iterations) before scaling
+# - Each commit must pass all tests (Keep CI Green)
+# - Completion promise for explicit "done" signal
+
+if [ -z "$1" ]; then
+  echo "Usage: ralph-loop <iterations>"
+  echo ""
+  echo "Tip: Start with 10-20 iterations to understand token consumption."
+  echo "     A 50-iteration loop can cost \$50-100+ on large codebases."
+  exit 1
+fi
+
+# Check for required files
+if [ ! -f "VISION.md" ]; then
+  echo "Error: VISION.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+if [ ! -f "AGENTS.md" ]; then
+  echo "Error: AGENTS.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+if [ ! -f "RAILS.md" ]; then
+  echo "Error: RAILS.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+if [ ! -f "PROMPT.md" ]; then
+  echo "Error: PROMPT.md not found. Run 'ralph-init' to create project files."
+  exit 1
+fi
+
+BASE_PROMPT=$(cat PROMPT.md)
+
+# Safety guardrail
+MAX_SAFE_ITERATIONS=50
+if [ "$1" -gt "$MAX_SAFE_ITERATIONS" ]; then
+  echo "Warning: $1 iterations exceeds safe limit of $MAX_SAFE_ITERATIONS."
+  echo "Are you sure? (y/N)"
+  read -r confirm
+  if [ "$confirm" != "y" ]; then
+    exit 1
+  fi
+fi
+
+LOG_FILE="ralph-log-$(date +%Y%m%d-%H%M%S).txt"
+echo "Starting Ralph loop at $(date)" | tee "$LOG_FILE"
+echo "Max iterations: $1" | tee -a "$LOG_FILE"
+
+for ((i=1; i<=$1; i++)); do
+  echo "" | tee -a "$LOG_FILE"
+  echo "=== Iteration $i of $1 ===" | tee -a "$LOG_FILE"
+
+  # Use temp file to capture output while showing it in real-time
+  TEMP_OUTPUT=$(mktemp)
+
+  # Build full prompt: base prompt + loop-specific completion signal
+  LOOP_SUFFIX="
+
+LOOP MODE INSTRUCTIONS:
+- You are running in a loop. Each iteration should complete exactly ONE task.
+- Ignore Backlog issues entirely - treat them as invisible.
+- After completing one task, simply end your response. Do NOT output <promise>COMPLETE</promise>.
+- ONLY output <promise>COMPLETE</promise> if 'bd ready' shows zero ready issues at the START of your run.
+- The loop controller will call you again for the next task."
+
+  FULL_PROMPT="${BASE_PROMPT}${LOOP_SUFFIX}"
+
+  claude --dangerously-skip-permissions -p "$FULL_PROMPT" 2>&1 | tee "$TEMP_OUTPUT"
+
+  result=$(cat "$TEMP_OUTPUT")
+  rm "$TEMP_OUTPUT"
+
+  # Also append to log file
+  echo "$result" >> "$LOG_FILE"
+
+  if [[ "$result" == *"<promise>COMPLETE</promise>"* ]]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo "All issues complete after $i iterations." | tee -a "$LOG_FILE"
+    exit 0
+  fi
+done
+
+echo "" | tee -a "$LOG_FILE"
+echo "Completed $1 iterations." | tee -a "$LOG_FILE"
+echo "Run 'bd ready' to check remaining work." | tee -a "$LOG_FILE"
