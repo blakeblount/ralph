@@ -82,6 +82,9 @@ LOOP MODE INSTRUCTIONS:
 
 $prompt = $basePrompt + $loopSuffix
 
+$consecutiveFailures = 0
+$MAX_CONSECUTIVE_FAILURES = 3
+
 for ($i = 1; $i -le $Iterations; $i++) {
     Write-Host ""
     Add-Content -Path $LOG_FILE -Value ""
@@ -90,11 +93,56 @@ for ($i = 1; $i -le $Iterations; $i++) {
     Add-Content -Path $LOG_FILE -Value $iterMessage
 
     # Run claude and capture output while displaying in real-time
-    claude --dangerously-skip-permissions -p $prompt 2>&1 | Tee-Object -Variable output
-    $output = $output -join "`n"
+    # Use try-catch to handle unhandled promise rejections from Node.js
+    $output = ""
+    $iterationFailed = $false
+    try {
+        # Temporarily allow errors so we can capture them
+        $ErrorActionPreference = "Continue"
+        claude --dangerously-skip-permissions -p $prompt 2>&1 | Tee-Object -Variable output
+        $exitCode = $LASTEXITCODE
+        $ErrorActionPreference = "Stop"
+
+        $output = $output -join "`n"
+
+        if ($exitCode -ne 0) {
+            $iterationFailed = $true
+            $errorMessage = "Warning: Claude exited with code $exitCode"
+            Write-Host $errorMessage -ForegroundColor Yellow
+            Add-Content -Path $LOG_FILE -Value $errorMessage
+        }
+    }
+    catch {
+        $ErrorActionPreference = "Stop"
+        $iterationFailed = $true
+        $errorMessage = "Warning: Iteration $i failed with error: $_"
+        Write-Host $errorMessage -ForegroundColor Yellow
+        Add-Content -Path $LOG_FILE -Value $errorMessage
+        $output = $output -join "`n"
+    }
 
     # Append to log file
     Add-Content -Path $LOG_FILE -Value $output
+
+    # Track consecutive failures
+    if ($iterationFailed) {
+        $consecutiveFailures++
+        if ($consecutiveFailures -ge $MAX_CONSECUTIVE_FAILURES) {
+            $abortMessage = "Aborting: $MAX_CONSECUTIVE_FAILURES consecutive failures. Check logs for details."
+            Write-Host $abortMessage -ForegroundColor Red
+            Add-Content -Path $LOG_FILE -Value $abortMessage
+            exit 1
+        }
+        $retryMessage = "Continuing to next iteration... ($consecutiveFailures/$MAX_CONSECUTIVE_FAILURES consecutive failures)"
+        Write-Host $retryMessage -ForegroundColor Yellow
+        Add-Content -Path $LOG_FILE -Value $retryMessage
+        # Brief pause before retry to avoid hammering on transient errors
+        Start-Sleep -Seconds 2
+        continue
+    }
+
+    # Reset consecutive failure counter on success
+    $consecutiveFailures = 0
 
     if ($output -match "<promise>COMPLETE</promise>") {
         Write-Host ""
