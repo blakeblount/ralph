@@ -19,6 +19,29 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+# Track Claude process globally for cleanup
+$script:ClaudeProcess = $null
+
+# Cleanup function to kill orphaned Claude processes
+function Stop-ClaudeProcess {
+    if ($script:ClaudeProcess -and -not $script:ClaudeProcess.HasExited) {
+        Write-Host "Cleaning up Claude process..." -ForegroundColor Yellow
+        try {
+            $script:ClaudeProcess.Kill()
+            $script:ClaudeProcess.WaitForExit(5000)
+        } catch {
+            # Process may have already exited
+        }
+    }
+}
+
+# Register cleanup for Ctrl+C and script exit
+$null = Register-EngineEvent -SourceIdentifier PowerShell.Exiting -Action { Stop-ClaudeProcess }
+trap {
+    Stop-ClaudeProcess
+    break
+}
+
 if (-not $Iterations -or $Iterations -le 0) {
     Write-Host "Usage: ralph-loop.ps1 <iterations>"
     Write-Host ""
@@ -92,49 +115,86 @@ for ($i = 1; $i -le $Iterations; $i++) {
     Write-Host $iterMessage
     Add-Content -Path $LOG_FILE -Value $iterMessage
 
-    # Run claude and capture output
-    $output = ""
+    # Use temp file to capture output while monitoring in real-time
+    $tempOutput = [System.IO.Path]::GetTempFileName()
     $iterationFailed = $false
 
     try {
-        $ErrorActionPreference = "Continue"
-        claude --dangerously-skip-permissions -p $prompt 2>&1 | Tee-Object -Variable output
-        $exitCode = $LASTEXITCODE
-        $ErrorActionPreference = "Stop"
+        # Start Claude in background, redirect output to temp file (like zsh version)
+        # This avoids blocking issues with .NET stream reading
+        $script:ClaudeProcess = Start-Process -FilePath "claude" `
+            -ArgumentList "--dangerously-skip-permissions", "-p", $prompt `
+            -RedirectStandardOutput $tempOutput `
+            -RedirectStandardError "$tempOutput.err" `
+            -NoNewWindow -PassThru
 
-        $output = $output -join "`n"
+        # Monitor for hanging errors while Claude runs (check every 30 seconds like zsh)
+        while (-not $script:ClaudeProcess.HasExited) {
+            # Check if error pattern appeared in output
+            if (Test-Path $tempOutput) {
+                $currentOutput = Get-Content -Path $tempOutput -Raw -ErrorAction SilentlyContinue
+                if ($currentOutput -match "Error: No messages returned|promise rejected with the reason") {
+                    Write-Host "Detected hanging error - killing Claude process..." -ForegroundColor Yellow
+                    Add-Content -Path $LOG_FILE -Value "Detected hanging error - killing Claude process..."
+                    $script:ClaudeProcess.Kill()
+                    $script:ClaudeProcess.WaitForExit(5000)
+                    $iterationFailed = $true
+                    break
+                }
+            }
+            Start-Sleep -Seconds 30
+        }
 
-        if ($exitCode -ne 0) {
+        # Wait for process to fully exit
+        $script:ClaudeProcess.WaitForExit()
+        $exitCode = $script:ClaudeProcess.ExitCode
+
+        # Read and display output
+        $output = ""
+        if (Test-Path $tempOutput) {
+            $output = Get-Content -Path $tempOutput -Raw -ErrorAction SilentlyContinue
+            if ($output) { Write-Host $output }
+        }
+        if (Test-Path "$tempOutput.err") {
+            $stderrOutput = Get-Content -Path "$tempOutput.err" -Raw -ErrorAction SilentlyContinue
+            if ($stderrOutput) {
+                Write-Host $stderrOutput -ForegroundColor Yellow
+                $output += $stderrOutput
+            }
+        }
+
+        # Check exit code
+        if ($exitCode -ne 0 -and -not $iterationFailed) {
             $iterationFailed = $true
             $errorMessage = "Warning: Claude exited with code $exitCode"
             Write-Host $errorMessage -ForegroundColor Yellow
             Add-Content -Path $LOG_FILE -Value $errorMessage
         }
+
+        # Final check for error patterns (in case they appeared at the end)
+        if (-not $iterationFailed -and $output -match "Error: No messages returned|promise rejected with the reason") {
+            $errorMessage = "Detected error pattern in output"
+            Write-Host $errorMessage -ForegroundColor Yellow
+            Add-Content -Path $LOG_FILE -Value $errorMessage
+            $iterationFailed = $true
+        }
     }
     catch {
-        $ErrorActionPreference = "Stop"
         $iterationFailed = $true
         $errorMessage = "Warning: Iteration $i failed with error: $_"
         Write-Host $errorMessage -ForegroundColor Yellow
         Add-Content -Path $LOG_FILE -Value $errorMessage
-        $output = $output -join "`n"
+        $output = ""
+        Stop-ClaudeProcess
     }
-
-    # Check for unhandled promise rejection errors
-    if ($output -match "Error: No messages returned") {
-        $errorMessage = "Detected error: No messages returned"
-        Write-Host $errorMessage -ForegroundColor Yellow
-        Add-Content -Path $LOG_FILE -Value $errorMessage
-        $iterationFailed = $true
-        # Kill any orphaned claude processes
-        Get-Process -Name "claude*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-    }
-    elseif ($output -match "promise rejected with the reason") {
-        $errorMessage = "Detected unhandled promise rejection"
-        Write-Host $errorMessage -ForegroundColor Yellow
-        Add-Content -Path $LOG_FILE -Value $errorMessage
-        $iterationFailed = $true
-        Get-Process -Name "claude*" -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+    finally {
+        $script:ClaudeProcess = $null
+        if (Test-Path $tempOutput) {
+            Remove-Item $tempOutput -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path "$tempOutput.err") {
+            Remove-Item "$tempOutput.err" -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # Append to log file
