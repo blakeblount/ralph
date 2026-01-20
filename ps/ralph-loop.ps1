@@ -22,12 +22,26 @@ $ErrorActionPreference = "Stop"
 # Track Claude process globally for cleanup
 $script:ClaudeProcess = $null
 
+# Kill a process and all its descendants
+function Stop-ProcessTree {
+    param([int]$ParentId)
+
+    # Find all child processes
+    $children = Get-CimInstance Win32_Process -Filter "ParentProcessId = $ParentId" -ErrorAction SilentlyContinue
+    foreach ($child in $children) {
+        Stop-ProcessTree -ParentId $child.ProcessId
+    }
+
+    # Kill the parent
+    Stop-Process -Id $ParentId -Force -ErrorAction SilentlyContinue
+}
+
 # Cleanup function to kill orphaned Claude processes
 function Stop-ClaudeProcess {
     if ($script:ClaudeProcess -and -not $script:ClaudeProcess.HasExited) {
-        Write-Host "Cleaning up Claude process..." -ForegroundColor Yellow
+        Write-Host "Cleaning up Claude process tree..." -ForegroundColor Yellow
         try {
-            $script:ClaudeProcess.Kill()
+            Stop-ProcessTree -ParentId $script:ClaudeProcess.Id
             $script:ClaudeProcess.WaitForExit(5000)
         } catch {
             # Process may have already exited
@@ -117,13 +131,17 @@ for ($i = 1; $i -le $Iterations; $i++) {
 
     # Use temp file to capture output while monitoring in real-time
     $tempOutput = [System.IO.Path]::GetTempFileName()
+    $tempPrompt = [System.IO.Path]::GetTempFileName()
     $iterationFailed = $false
 
     try {
-        # Start Claude in background, redirect output to temp file (like zsh version)
-        # This avoids blocking issues with .NET stream reading
-        $script:ClaudeProcess = Start-Process -FilePath "claude" `
-            -ArgumentList "--dangerously-skip-permissions", "-p", $prompt `
+        # Write prompt to temp file to avoid escaping issues
+        Set-Content -Path $tempPrompt -Value $prompt -NoNewline
+
+        # Call node directly with claude-code CLI, bypassing the .ps1 wrapper
+        $claudeCli = "$env:APPDATA\npm\node_modules\@anthropic-ai\claude-code\cli.js"
+        $script:ClaudeProcess = Start-Process -FilePath "node.exe" `
+            -ArgumentList $claudeCli, "--dangerously-skip-permissions", "-p", $tempPrompt `
             -RedirectStandardOutput $tempOutput `
             -RedirectStandardError "$tempOutput.err" `
             -NoNewWindow -PassThru
@@ -133,11 +151,10 @@ for ($i = 1; $i -le $Iterations; $i++) {
             # Check if error pattern appeared in output
             if (Test-Path $tempOutput) {
                 $currentOutput = Get-Content -Path $tempOutput -Raw -ErrorAction SilentlyContinue
-                if ($currentOutput -match "Error: No messages returned|promise rejected with the reason") {
-                    Write-Host "Detected hanging error - killing Claude process..." -ForegroundColor Yellow
-                    Add-Content -Path $LOG_FILE -Value "Detected hanging error - killing Claude process..."
-                    $script:ClaudeProcess.Kill()
-                    $script:ClaudeProcess.WaitForExit(5000)
+                if ($currentOutput -match "Error: No messages returned|promise rejected with the reason|processTicksAndRejections") {
+                    Write-Host "Detected hanging error - killing Claude process tree..." -ForegroundColor Yellow
+                    Add-Content -Path $LOG_FILE -Value "Detected hanging error - killing Claude process tree..."
+                    Stop-ProcessTree -ParentId $script:ClaudeProcess.Id
                     $iterationFailed = $true
                     break
                 }
@@ -148,6 +165,13 @@ for ($i = 1; $i -le $Iterations; $i++) {
         # Wait for process to fully exit
         $script:ClaudeProcess.WaitForExit()
         $exitCode = $script:ClaudeProcess.ExitCode
+
+        # Debug: show exit code info
+        if ($null -eq $exitCode) {
+            Write-Host "[Debug] Exit code: null" -ForegroundColor Cyan
+        } else {
+            Write-Host "[Debug] Exit code: $exitCode" -ForegroundColor Cyan
+        }
 
         # Read and display output
         $output = ""
@@ -163,8 +187,8 @@ for ($i = 1; $i -le $Iterations; $i++) {
             }
         }
 
-        # Check exit code
-        if ($exitCode -ne 0 -and -not $iterationFailed) {
+        # Check exit code - treat null/empty/0 as success
+        if ($null -ne $exitCode -and $exitCode -ne 0 -and -not $iterationFailed) {
             $iterationFailed = $true
             $errorMessage = "Warning: Claude exited with code $exitCode"
             Write-Host $errorMessage -ForegroundColor Yellow
@@ -194,6 +218,9 @@ for ($i = 1; $i -le $Iterations; $i++) {
         }
         if (Test-Path "$tempOutput.err") {
             Remove-Item "$tempOutput.err" -Force -ErrorAction SilentlyContinue
+        }
+        if (Test-Path $tempPrompt) {
+            Remove-Item $tempPrompt -Force -ErrorAction SilentlyContinue
         }
     }
 
