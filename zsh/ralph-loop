@@ -83,32 +83,35 @@ LOOP MODE INSTRUCTIONS:
 
   FULL_PROMPT="${BASE_PROMPT}${LOOP_SUFFIX}"
 
-  # Run claude and capture exit code (don't exit on failure)
+  # Run claude in background so we can monitor and kill if it hangs
   iteration_failed=false
 
-  claude --dangerously-skip-permissions -p "$FULL_PROMPT" 2>&1 | tee "$TEMP_OUTPUT"
-  exit_code=${PIPESTATUS[0]}
+  claude --dangerously-skip-permissions -p "$FULL_PROMPT" > "$TEMP_OUTPUT" 2>&1 &
+  CLAUDE_PID=$!
 
-  # Show output in log
+  # Monitor for hanging errors while Claude runs
+  while kill -0 $CLAUDE_PID 2>/dev/null; do
+    # Check if error pattern appeared
+    if grep -q "Error: No messages returned\|promise rejected with the reason" "$TEMP_OUTPUT" 2>/dev/null; then
+      echo "Detected hanging error - killing Claude process..." | tee -a "$LOG_FILE"
+      kill $CLAUDE_PID 2>/dev/null
+      wait $CLAUDE_PID 2>/dev/null
+      iteration_failed=true
+      break
+    fi
+    sleep 30
+  done
+
+  # Wait for Claude to finish (if it exited normally)
+  wait $CLAUDE_PID 2>/dev/null
+  exit_code=$?
+
+  # Display output
+  cat "$TEMP_OUTPUT"
   cat "$TEMP_OUTPUT" >> "$LOG_FILE"
-
-  # Check for unhandled promise rejection errors that may leave process hanging or indicate failure
-  if grep -q "Error: No messages returned" "$TEMP_OUTPUT" 2>/dev/null; then
-    echo "Detected error: No messages returned" | tee -a "$LOG_FILE"
-    iteration_failed=true
-    # Kill any orphaned claude processes from this iteration
-    pkill -f "claude.*dangerously-skip-permissions" 2>/dev/null || true
-  elif grep -q "promise rejected with the reason" "$TEMP_OUTPUT" 2>/dev/null; then
-    echo "Detected unhandled promise rejection" | tee -a "$LOG_FILE"
-    iteration_failed=true
-    pkill -f "claude.*dangerously-skip-permissions" 2>/dev/null || true
-  fi
 
   result=$(cat "$TEMP_OUTPUT")
   rm "$TEMP_OUTPUT"
-
-  # Also append to log file
-  echo "$result" >> "$LOG_FILE"
 
   # Check if iteration failed
   if [ $exit_code -ne 0 ]; then
