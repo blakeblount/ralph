@@ -92,20 +92,73 @@ for ($i = 1; $i -le $Iterations; $i++) {
     Write-Host $iterMessage
     Add-Content -Path $LOG_FILE -Value $iterMessage
 
-    # Run claude and capture output while displaying in real-time
-    # Use try-catch to handle unhandled promise rejections from Node.js
+    # Run claude and capture output while monitoring for hanging errors
+    # Claude CLI can throw unhandled promise rejections that hang the process
     $output = ""
     $iterationFailed = $false
+    $tempFile = [System.IO.Path]::GetTempFileName()
+
     try {
-        # Temporarily allow errors so we can capture them
-        $ErrorActionPreference = "Continue"
-        claude --dangerously-skip-permissions -p $prompt 2>&1 | Tee-Object -Variable output
-        $exitCode = $LASTEXITCODE
-        $ErrorActionPreference = "Stop"
+        # Start claude as a background process so we can monitor and kill if needed
+        $pinfo = New-Object System.Diagnostics.ProcessStartInfo
+        $pinfo.FileName = "claude"
+        $pinfo.Arguments = "--dangerously-skip-permissions -p `"$($prompt -replace '"', '\"')`""
+        $pinfo.RedirectStandardOutput = $true
+        $pinfo.RedirectStandardError = $true
+        $pinfo.UseShellExecute = $false
+        $pinfo.CreateNoWindow = $true
 
-        $output = $output -join "`n"
+        $process = New-Object System.Diagnostics.Process
+        $process.StartInfo = $pinfo
 
-        if ($exitCode -ne 0) {
+        # Collect output asynchronously
+        $outputBuilder = New-Object System.Text.StringBuilder
+        $errorBuilder = New-Object System.Text.StringBuilder
+
+        $outputEvent = Register-ObjectEvent -InputObject $process -EventName OutputDataReceived -Action {
+            if ($EventArgs.Data) {
+                $Event.MessageData.AppendLine($EventArgs.Data)
+                Write-Host $EventArgs.Data
+            }
+        } -MessageData $outputBuilder
+
+        $errorEvent = Register-ObjectEvent -InputObject $process -EventName ErrorDataReceived -Action {
+            if ($EventArgs.Data) {
+                $Event.MessageData.AppendLine($EventArgs.Data)
+                Write-Host $EventArgs.Data -ForegroundColor Red
+            }
+        } -MessageData $errorBuilder
+
+        $process.Start() | Out-Null
+        $process.BeginOutputReadLine()
+        $process.BeginErrorReadLine()
+
+        # Monitor for hanging error patterns
+        while (-not $process.HasExited) {
+            Start-Sleep -Milliseconds 500
+            $currentOutput = $outputBuilder.ToString() + $errorBuilder.ToString()
+
+            # Check for the specific hanging error
+            if ($currentOutput -match "Error: No messages returned" -or
+                ($currentOutput -match "promise rejected with the reason" -and $currentOutput -match "Error:")) {
+                $hangMessage = "Detected hanging error. Killing Claude process..."
+                Write-Host $hangMessage -ForegroundColor Yellow
+                Add-Content -Path $LOG_FILE -Value $hangMessage
+                $process.Kill()
+                $iterationFailed = $true
+                break
+            }
+        }
+
+        # Wait for process to fully exit and clean up events
+        $process.WaitForExit()
+        Unregister-Event -SourceIdentifier $outputEvent.Name
+        Unregister-Event -SourceIdentifier $errorEvent.Name
+
+        $output = $outputBuilder.ToString() + $errorBuilder.ToString()
+        $exitCode = $process.ExitCode
+
+        if ($exitCode -ne 0 -and -not $iterationFailed) {
             $iterationFailed = $true
             $errorMessage = "Warning: Claude exited with code $exitCode"
             Write-Host $errorMessage -ForegroundColor Yellow
@@ -113,12 +166,18 @@ for ($i = 1; $i -le $Iterations; $i++) {
         }
     }
     catch {
-        $ErrorActionPreference = "Stop"
         $iterationFailed = $true
         $errorMessage = "Warning: Iteration $i failed with error: $_"
         Write-Host $errorMessage -ForegroundColor Yellow
         Add-Content -Path $LOG_FILE -Value $errorMessage
-        $output = $output -join "`n"
+    }
+    finally {
+        if ($process -and -not $process.HasExited) {
+            $process.Kill()
+        }
+        if (Test-Path $tempFile) {
+            Remove-Item $tempFile -Force
+        }
     }
 
     # Append to log file
